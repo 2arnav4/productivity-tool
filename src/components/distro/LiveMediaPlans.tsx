@@ -1,13 +1,17 @@
 "use client";
 
-import { useState, useEffect, useCallback, useMemo } from "react";
+import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createClient } from "@/lib/supabase";
+import { STATS, rowStat, rowFetchedAt, planExportRows, lineToMetrics, currentLinks, type LinkMetrics, type MetricsByLink, type StatsLine } from "@/lib/live-plan-metrics";
+import { fetchPlanStats, NO_ANSWER } from "@/lib/live-plan-stats-client";
 import {
   Radar, Loader2, ExternalLink, ShieldCheck, Wallet, Lock, Search,
-  CheckCircle2, Circle, Link2, AlertTriangle, FileSpreadsheet,
+  CheckCircle2, Circle, Link2, AlertTriangle, FileSpreadsheet, Download, CloudUpload, RefreshCw, RotateCcw,
 } from "lucide-react";
 
 const supabase = createClient();
+
+const READ_SAVED_EVERY_MS = 60_000;
 
 interface Item {
   id: string;
@@ -71,6 +75,12 @@ const compact = (n?: number) => {
   return String(n);
 };
 
+// compact() turns a real 0 into a dash, so stats only dash a missing value
+const COUNTED = ["views", "likes", "comments", "shares", "reposts"] as const;
+const hasNumbers = (m?: LinkMetrics) => !!m && COUNTED.some(k => typeof m[k] === "number");
+const fetchedLabel = (at?: string) => at ? `Fetched ${new Date(at).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })}` : undefined;
+const formatStat = (n: number | null) => n === null ? "—" : n === 0 ? "0" : compact(n);
+
 function normaliseUrl(raw: string) {
   const v = raw.trim();
   if (!v) return "";
@@ -94,6 +104,16 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
   const [search, setSearch] = useState("");
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState("");
+  const [exporting, setExporting] = useState(false);
+  const [stats, setStats] = useState<MetricsByLink>({});
+  const [pending, setPending] = useState<Set<string>>(new Set());
+  // Per plan, so one client's fetch never blocks another's or shows on its page. A count, because a paste can overlap a Refresh.
+  const [fetchCounts, setFetchCounts] = useState<Record<string, number>>({});
+  const [statusByPlan, setStatusByPlan] = useState<Record<string, { text: string; isError: boolean }>>({});
+  const [schedule, setSchedule] = useState<{ lastRunAt: string | null; stale: boolean } | null>(null);
+  const pendingRef = useRef(pending); // Lets the timed read skip links being fetched without restarting its timer.
+  const [readTick, setReadTick] = useState(0);
+  const [savingToDrive, setSavingToDrive] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -109,7 +129,7 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
         ...b,
         media_plans: (b.media_plans || [])
           .filter(p => (p as unknown as { source?: string }).source === "upload" && (p.media_plan_items || []).length > 0)
-          .map(p => ({ ...p, media_plan_items: p.media_plan_items.map(i => ({ ...i, live_links: Array.isArray(i.live_links) ? i.live_links : [] })) })),
+          .map(p => ({ ...p, media_plan_items: p.media_plan_items.map(i => ({ ...i, live_links: Array.isArray(i.live_links) ? (i.live_links as unknown[]).map(l => (typeof l === "string" ? l : "")) : [] })) })),
       }))
       .filter(b => b.media_plans.length > 0);
     setBriefs(list);
@@ -133,7 +153,8 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
     })));
   }
 
-  async function update(item: Item, patch: Partial<Item>, dbPatch: Record<string, unknown>) {
+  /** Only says true once the database has the change, so nothing paid starts on a change that didn't land. */
+  async function update(item: Item, patch: Partial<Item>, dbPatch: Record<string, unknown>): Promise<boolean> {
     setError("");
     setBusy(item.id);
     const before = { ...item };
@@ -144,15 +165,19 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
       // Database rules are the source of truth — roll back and say why
       patchLocal(item.id, before);
       setError(error.message);
+      return false;
     }
+    return true;
   }
 
-  function setLink(item: Item, idx: number, value: string) {
+  async function setLink(item: Item, idx: number, value: string) {
     const links = [...(item.live_links || [])];
     while (links.length < item.quantity) links.push("");
     links[idx] = normaliseUrl(value);
     if (links[idx] === (item.live_links || [])[idx]) return;
-    update(item, { live_links: links }, { live_links: links });
+    const saved = await update(item, { live_links: links }, { live_links: links });
+    // A link's first fetch happens when it's attached. A link with saved numbers costs nothing here.
+    if (saved && links[idx] && plan) fetchStats("attach", [links[idx]]);
   }
 
   function toggleVerified(item: Item) {
@@ -188,7 +213,167 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
       { total_cost: v, rate: v ? v / item.quantity : null });
   }
 
+  const planLinks = useMemo(() => [...new Set(items.flatMap(i => currentLinks(i)))], [items]);
+  const planId = plan?.id;
+  const fetching = !!planId && (fetchCounts[planId] ?? 0) > 0;
+  const status = planId ? statusByPlan[planId] : undefined;
+
+  useEffect(() => { pendingRef.current = pending; }, [pending]);
+
+  // Saved numbers only: reading never pays for anything, and never schedules anything.
+  // Runs on every card click, then on a timer while the tab is visible, so one person's fetch reaches everyone.
+  useEffect(() => {
+    if (!planId) return;
+    let active = true;
+    let reading = false;
+    const read = async (showProblems: boolean) => {
+      if (reading) return;
+      reading = true;
+      try {
+        const res = await fetch("/api/distro/live-plan-stats", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ planId, mode: "read" }),
+        });
+        const data = await res.json() as { lines?: StatsLine[]; notice?: string; error?: string; schedule?: { lastRunAt: string | null; stale: boolean } };
+        if (!res.ok) throw new Error(data.error);
+        if (!active) return;
+        // A link being fetched here keeps its live state, so an older saved answer can't overwrite it.
+        const saved = (data.lines ?? []).filter(l => !pendingRef.current.has(l.link));
+        setStats(prev => ({ ...prev, ...Object.fromEntries(saved.map(l => [l.link, lineToMetrics(l)])) }));
+        if (data.schedule) setSchedule(data.schedule);
+        if (data.notice && showProblems) setStatusByPlan(prev => ({ ...prev, [planId]: { text: data.notice as string, isError: true } }));
+      } catch (err) {
+        // A failed timed read stays quiet: the numbers on screen remain and the next read tries again.
+        if (active && showProblems) {
+          const text = err instanceof Error && err.message ? err.message : "Saved stats couldn't be loaded. Please try again.";
+          setStatusByPlan(prev => ({ ...prev, [planId]: { text, isError: true } }));
+        }
+      } finally {
+        reading = false;
+      }
+    };
+    read(true);
+    const timer = setInterval(() => { if (document.visibilityState === "visible") read(false); }, READ_SAVED_EVERY_MS);
+    return () => { active = false; clearInterval(timer); };
+  }, [planId, readTick]);
+
+  function setPlanStatus(forPlan: string, next: { text: string; isError: boolean }) {
+    setStatusByPlan(prev => ({ ...prev, [forPlan]: next }));
+  }
+
+  function applyLine(line: StatsLine) {
+    setStats(prev => {
+      const before = prev[line.link];
+      let next: LinkMetrics;
+      // After a failed fetch the last good numbers stay on screen, and say so.
+      if (line.error && hasNumbers(before)) next = { ...before, error: undefined, warning: "Refresh failed. Showing last numbers" };
+      else if (!line.done && before) next = { ...before, ...lineToMetrics(line), notes: { ...before.notes, ...lineToMetrics(line).notes } };
+      else next = lineToMetrics(line);
+      if (line.done && !line.savedAt && hasNumbers(next) && !line.error) next = { ...next, fetched_at: new Date().toISOString() };
+      return { ...prev, [line.link]: next };
+    });
+    if (line.done) setPending(prev => { const copy = new Set(prev); copy.delete(line.link); return copy; });
+  }
+
+  /** Says what actually happened, link by link. A failure never reads as a success. */
+  function describe(forPlan: string, results: Map<string, StatsLine>) {
+    const lines = [...results.values()];
+    const failed = lines.filter(l => l.error && !l.unusable).length;
+    const unusable = lines.filter(l => l.unusable).length;
+    const flagged = lines.filter(l => !l.error && l.warning).length;
+    const saved = lines.filter(l => !l.error && !l.warning && l.savedAt).length;
+    const updated = lines.length - failed - unusable - flagged - saved;
+    const parts = [
+      updated && `${updated} updated at ${new Date().toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit" })}`,
+      saved && `${saved} showing saved numbers`,
+      failed && `${failed} could not be read`,
+      flagged && `${flagged} need a look (hover the row)`,
+      unusable && `${unusable} can't give stats`,
+    ].filter(Boolean);
+    setPlanStatus(forPlan, parts.length ? { text: `${parts.join(", ")}.`, isError: failed + flagged > 0 } : { text: "This plan has no links yet.", isError: false });
+  }
+
+  async function fetchStats(mode: "attach" | "refresh", links?: string[]) {
+    if (!planId) return;
+    const forPlan = planId; // The user can switch clients mid-fetch, so this run stays tied to the plan it started on.
+    const targets = links ?? planLinks;
+    setPending(prev => new Set([...prev, ...targets]));
+    setFetchCounts(prev => ({ ...prev, [forPlan]: (prev[forPlan] ?? 0) + 1 }));
+    setPlanStatus(forPlan, { text: `Fetching ${targets.length} link${targets.length === 1 ? "" : "s"}…`, isError: false });
+    const results = new Map<string, StatsLine>();
+    try {
+      const unanswered = await fetchPlanStats({
+        planId: forPlan, mode, links,
+        onLine: line => {
+          applyLine(line);
+          if (line.done) {
+            results.set(line.link, line);
+            setPlanStatus(forPlan, { text: `Fetched ${results.size} of ${targets.length} links…`, isError: false });
+          }
+        },
+      });
+      unanswered.forEach(link => { const line = { link, done: true, error: NO_ANSWER }; results.set(link, line); applyLine(line); });
+      describe(forPlan, results);
+    } catch (err) {
+      setPlanStatus(forPlan, { text: err instanceof Error && err.message ? err.message : "Stats could not be fetched. Please try again.", isError: true });
+    } finally {
+      setPending(prev => { const copy = new Set(prev); targets.forEach(t => copy.delete(t)); return copy; });
+      setFetchCounts(prev => ({ ...prev, [forPlan]: Math.max(0, (prev[forPlan] ?? 1) - 1) }));
+    }
+  }
+
+  // Links worth paying to try again. A link that can never give stats isn't one of them.
+  const flagged = planLinks.filter(l => (stats[l]?.error || stats[l]?.warning) && !stats[l]?.unusable);
+
   const categories = useMemo(() => [...new Set(items.map(i => i.category || "Uncategorised"))], [items]);
+
+  // Exports the whole plan, ignoring the filters, in the table's order so # matches what's on screen
+  async function exportExcel() {
+    if (!brief) return;
+    setError("");
+    setExporting(true);
+    try {
+      // Loaded on click to keep xlsx out of the page's initial bundle
+      const XLSX = await import("xlsx");
+      const rows = planExportRows(items.map(i => ({ ...i, metrics: stats })));
+      const workbook = XLSX.utils.book_new();
+      XLSX.utils.book_append_sheet(workbook, XLSX.utils.json_to_sheet(rows), "Live Media Plan");
+      XLSX.writeFile(workbook, `${brief.brand_name} - Live Media Plan.xlsx`);
+    } catch {
+      setError("Could not create the Excel file. Please try again.");
+    } finally {
+      setExporting(false);
+    }
+  }
+
+  async function saveToDrive() {
+    if (!plan) return;
+    setError("");
+    // Opened before the request, because browsers block a new tab opened after one finishes
+    const tab = window.open("", "_blank");
+    if (!tab) {
+      setError("Your browser blocked the new tab. Allow pop-ups for this site and try again.");
+      return;
+    }
+    tab.opener = null;
+    setSavingToDrive(true);
+    try {
+      const res = await fetch("/api/distro/export-live-plan-sheet", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ planId: plan.id }),
+      });
+      const data = await res.json() as { url?: string; error?: string };
+      if (!res.ok || !data.url) throw new Error(data.error || "Could not save to Google Drive. Please try again.");
+      tab.location.href = data.url;
+    } catch (err) {
+      tab.close();
+      setError(err instanceof Error ? err.message : "Could not save to Google Drive. Please try again.");
+    } finally {
+      setSavingToDrive(false);
+    }
+  }
 
   const visible = items.filter(i => {
     if (stage !== "all" && stageOf(i) !== stage) return false;
@@ -244,7 +429,7 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
               const its = b.media_plans[0]?.media_plan_items || [];
               const done = its.filter(i => i.verified).length;
               return (
-                <button key={b.id} onClick={() => { setActiveId(b.id); setCategory(""); setStage("all"); }}
+                <button key={b.id} onClick={() => { setActiveId(b.id); setCategory(""); setStage("all"); setReadTick(t => t + 1); }}
                   className={`shrink-0 text-left px-3 py-2 rounded-xl border transition-colors ${b.id === activeId ? "bg-emerald-50 border-emerald-300" : "bg-white border-slate-200 hover:border-slate-300"}`}>
                   <p className="text-sm font-semibold text-slate-900">{b.brand_name}</p>
                   <p className="text-[11px] text-slate-500">
@@ -320,7 +505,42 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
                 <input value={search} onChange={e => setSearch(e.target.value)} placeholder="Search pages…"
                   className="pl-8 pr-3 py-1.5 border border-slate-200 rounded-lg text-xs bg-white focus:outline-none focus:ring-2 focus:ring-emerald-500 w-44" />
               </div>
+              <button onClick={() => fetchStats("refresh")} disabled={fetching}
+                title="Fetch new numbers for every link on this plan"
+                className="sm:ml-auto inline-flex items-center gap-1.5 px-3 py-1.5 border border-slate-200 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                <RefreshCw className={`w-3.5 h-3.5 ${fetching ? "animate-spin" : ""}`} />
+                Refresh
+              </button>
+              {flagged.length > 0 && (
+                <button onClick={() => fetchStats("refresh", flagged)} disabled={fetching}
+                  title="Fetch only the links that failed or need a look"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-amber-200 rounded-lg text-xs font-medium text-amber-800 bg-amber-50 hover:bg-amber-100 disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-amber-400">
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  Retry {flagged.length} flagged
+                </button>
+              )}
+              <button onClick={exportExcel} disabled={exporting}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-slate-200 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                {exporting ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Download className="w-3.5 h-3.5" />}
+                Export Excel
+              </button>
+              <button onClick={saveToDrive} disabled={savingToDrive}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 border border-slate-200 rounded-lg text-xs font-medium text-slate-700 bg-white hover:bg-slate-50 disabled:opacity-60 focus:outline-none focus:ring-2 focus:ring-emerald-500">
+                {savingToDrive ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CloudUpload className="w-3.5 h-3.5" />}
+                Save to Drive
+              </button>
             </div>
+
+            {status && (
+              <p role="status" className={`text-xs ${status.isError ? "text-rose-700" : "text-slate-500"}`}>{status.text}</p>
+            )}
+
+            {schedule?.stale && (
+              <div className="flex items-start gap-2 text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2">
+                <AlertTriangle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
+                {schedule.lastRunAt ? `The scheduled refresh last ran ${fetchedLabel(schedule.lastRunAt)?.replace("Fetched ", "")}, so second fetches may be late. Check the cron job.` : "The scheduled refresh hasn't run yet, so second fetches won't happen until the cron job is set up."}
+              </div>
+            )}
 
             {error && (
               <div className="flex items-start gap-2 text-sm text-rose-700 bg-rose-50 border border-rose-200 rounded-lg px-3 py-2">
@@ -340,16 +560,17 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
                       <th className="text-center px-3 py-2.5 font-semibold">Deliv.</th>
                       <th className="text-right px-3 py-2.5 font-semibold">Payout</th>
                       <th className="text-left px-3 py-2.5 font-semibold min-w-[260px]">Live Links</th>
+                      {STATS.map(s => <th key={s.key} className="text-right px-3 py-2.5 font-semibold">{s.label}</th>)}
                       <th className="text-center px-3 py-2.5 font-semibold">Verified</th>
                       <th className="text-center px-4 py-2.5 font-semibold">Paid</th>
                     </tr>
                   </thead>
                   {grouped.length === 0 ? (
-                    <tbody><tr><td colSpan={8} className="text-center py-12 text-sm text-slate-400">Nothing matches these filters.</td></tr></tbody>
+                    <tbody><tr><td colSpan={14} className="text-center py-12 text-sm text-slate-400">Nothing matches these filters.</td></tr></tbody>
                   ) : grouped.map(g => (
                     <tbody key={g.category} className="divide-y divide-slate-50">
                       <tr className="bg-slate-50">
-                        <td colSpan={8} className="px-4 py-1.5 text-xs font-semibold text-slate-600">
+                        <td colSpan={14} className="px-4 py-1.5 text-xs font-semibold text-slate-600">
                           {g.category} <span className="font-normal text-slate-400">· {g.rows.length}</span>
                         </td>
                       </tr>
@@ -419,8 +640,23 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
                                     )}
                                   </div>
                                 ))}
+                                {currentLinks(item).filter(l => stats[l]?.error || stats[l]?.warning).map(l => (
+                                  <p key={l} className={`text-[11px] leading-snug ${stats[l]?.unusable ? "text-slate-400" : "text-amber-700 whitespace-nowrap"}`}>{stats[l]?.error || stats[l]?.warning}</p>
+                                ))}
                               </div>
                             </td>
+                            {STATS.map(s => {
+                              const row = { ...item, metrics: stats };
+                              const stat = rowStat(row, s.key);
+                              const loadingCell = stat.value === null && currentLinks(item).some(l => pending.has(l));
+                              return (
+                                <td key={s.key} title={[stat.reason, stat.value !== null ? fetchedLabel(rowFetchedAt(row)) : undefined].filter(Boolean).join(". ") || undefined} className="px-3 py-3 text-right text-slate-600 tabular-nums">
+                                  {loadingCell
+                                    ? <span className="inline-block w-8 h-3 rounded bg-slate-200 animate-pulse" />
+                                    : <span className={stat.partial ? "underline decoration-dotted underline-offset-2 cursor-help" : ""}>{formatStat(stat.value)}</span>}
+                                </td>
+                              );
+                            })}
                             <td className="px-3 py-3 text-center">
                               <button onClick={() => toggleVerified(item)}
                                 disabled={!canVerify || item.paid || busy === item.id}
