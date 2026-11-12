@@ -21,6 +21,7 @@ const SERVICE_DOWN = 'Fetching unavailable right now. Please retry later';
 const COULD_NOT_READ = "Couldn't fetch right now. Please retry";
 const STUCK = 'Numbers keep changing sharply. Please check manually';
 const NOT_A_POST = 'Profile link. Add a post or reel link';
+const QUEUED = 'Many new links this hour. Numbers will be fetched automatically within a few hours';
 
 /** A link that can never give stats: not Instagram, a Story, a profile. Retrying it can't help. */
 export class UnusableLink extends RefusedLink {}
@@ -114,6 +115,11 @@ type Outcome = 'saved' | 'failed' | 'held' | 'service' | 'limit';
 type Answer = { report: Report; key?: string; savedAt?: string | null; warning?: string; outcome?: Outcome };
 type Running = { job: Promise<Answer>; latest?: Report; listeners: Set<(r: Report) => void> };
 
+/** Who is asking, and which limit stops this request paying. A Refresh pays each link at most once; attaching has a per-user hourly cap. */
+export type Payer =
+  | { refresh: { id: string; since: string } }
+  | { attach: { userId: string; limit: number; windowSeconds: number } };
+
 export interface StatsDeps {
   store: StatsStore;
   scrapeFn?: typeof scrape;
@@ -149,18 +155,16 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
       .then(() =>
         scrapeFn(link.url, {
           noAccount: true, // Followers come from the plan.
-          // PARKED: daily limit. Off unless DAILY_LIMIT_USD is set, so by default nothing is counted or stopped.
-          ...(Number.isFinite(config.dailyLimitUsd) && {
-            budget: async (usd: number) => {
-              try {
-                return await store.reserveSpend(usd, config.dailyLimitUsd);
-              } catch (e) {
-                console.error(`Could not check the spending limit: ${(e as Error).message}`);
-                storageDown = true;
-                return false;
-              }
-            },
-          }),
+          // Every paid call is counted against the daily limit first. If the count can't be checked, nothing is paid for.
+          budget: async (usd: number) => {
+            try {
+              return await store.reserveSpend(usd, config.dailyLimitUsd);
+            } catch (e) {
+              console.error(`Could not check the spending limit: ${(e as Error).message}`);
+              storageDown = true;
+              return false;
+            }
+          },
           onUpdate: (r: Report) => {
             // Numbers streamed over saved ones could be wrong, and would show before anything checks them. Saved numbers stay until the final answer.
             if (record.report) return;
@@ -199,6 +203,7 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
         } else if (report.budgetStopped) {
           // Nothing was paid for, so nothing should wait because of it.
           await stored('let go of a link', () => store.release(key, token));
+          void alert('daily-limit', `Instagram stats reached the daily spending limit ($${config.dailyLimitUsd}), so fetching has stopped until 5:30 AM IST. Saved numbers still show. If this wasn't expected, check who added links today.`);
           outcome = 'limit';
         } else {
           // A partial answer only fills an empty record, so it can never overwrite good numbers. An answer sources disagree on is never saved.
@@ -242,11 +247,23 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
     return link;
   }
 
+  /** After a claim, whether this request's limit lets it pay. If not, the claim is let go of for free. Fails closed when storage can't say. */
+  async function mayPay(claimed: LinkRecord, payer: Payer): Promise<boolean> {
+    const allowed = await stored('check the fetch limit', () =>
+      'refresh' in payer ? store.markRefreshed(payer.refresh.id, claimed.key) : store.takeAttachFetch(payer.attach.userId, payer.attach.limit, payer.attach.windowSeconds),
+    );
+    if (allowed) return true;
+    await stored('let go of a link', () => store.release(claimed.key, claimed.claimToken!));
+    if (allowed === undefined) throw new RefusedLink(NO_STORAGE);
+    return false;
+  }
+
   /**
    * Answers one link. A saved complete answer costs nothing.
-   * `since` is when a Refresh began: anything saved before it was never refreshed and is paid for, anything saved after it isn't paid for twice.
+   * For a Refresh, `since` is when it began: anything saved before it was never refreshed and is paid for, anything saved after it isn't paid for twice.
    */
-  async function lookup(raw: string, since: string | undefined, onUpdate: (r: Report) => void): Promise<Answer> {
+  async function lookup(raw: string, payer: Payer, onUpdate: (r: Report) => void): Promise<Answer> {
+    const since = 'refresh' in payer ? payer.refresh.since : undefined;
     const link = await linkOf(raw);
     // Posts key on the ID alone, because /p/CODE and /reel/CODE are one post.
     const key = link.shortcode ?? link.url;
@@ -271,6 +288,12 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
     const claimed = await stored('claim a link', () => store.claim(key, CLAIM_TTL_SECONDS));
     if (claimed === undefined) throw new RefusedLink(NO_STORAGE);
     if (claimed === null) throw new StillRunning();
+    if (!(await mayPay(claimed, payer))) {
+      // A resent Refresh that already paid for this link, or over the attach limit. Attached links are picked up by the scheduled job.
+      const reason = since ? (waitingToRetry(record) ?? record.lastError ?? COULD_NOT_READ) : QUEUED;
+      if (record.report) return { report: record.report, key, savedAt: record.lastFetchedAt, warning: reason };
+      throw new RefusedLink(reason);
+    }
     return fetchClaimed(claimed, link, !!since, onUpdate);
   }
 
@@ -314,8 +337,8 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
    * One JSON object per line through `send`, as numbers arrive. A request starts links for a short while and answers before any host would cut it off.
    * The last line lists what's left, and the page asks again. Nothing depends on work continuing after the answer.
    */
-  async function answerLinks(opts: { links: string[]; wait: string[]; since?: string; isGone: () => boolean; send: (line: object) => void }) {
-    const { since, isGone, send } = opts;
+  async function answerLinks(opts: { links: string[]; wait: string[]; payer: Payer; isGone: () => boolean; send: (line: object) => void }) {
+    const { payer, isGone, send } = opts;
     const queue = [...new Set(opts.wait), ...new Set(opts.links)];
     const started = Date.now();
     const inFlight = new Set<string>();
@@ -328,7 +351,7 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
         inFlight.add(raw);
         try {
           if (raw.length > 2048) throw new UnusableLink('This link is too long to be a real post link');
-          const { report, key, savedAt, warning } = await lookup(raw, since, (update) => send(toLine(raw, update, false, undefined)));
+          const { report, key, savedAt, warning } = await lookup(raw, payer, (update) => send(toLine(raw, update, false, undefined)));
           send(toLine(raw, report, true, key, { savedAt, warning }));
         } catch (e) {
           if (e instanceof StillRunning) askAgain.add(raw);
@@ -356,6 +379,7 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
         const answer = await fetchClaimed(record, parseLink(record.url), false);
         summary.unfinished--;
         if (answer.outcome === 'service') summary.stopped = 'service';
+        else if (answer.outcome === 'limit') summary.stopped ??= 'limit';
         else if (answer.outcome === 'saved') summary.saved++;
         else if (answer.outcome === 'held') summary.held++;
         else if (answer.outcome === 'failed') summary.failed++;
@@ -371,13 +395,25 @@ export function createStatsService({ store, scrapeFn = scrape, resolveLink = res
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([Promise.all(jobs), new Promise((done) => (timer = setTimeout(done, opts.budgetMs)))]);
     clearTimeout(timer);
-    await store.finishRun(runId, summary);
+    // A snapshot for the answer: fetches past the budget keep changing `summary`, sources included.
+    const answered = { ...summary, sources: { ...summary.sources } };
+    const firstWrite = store.finishRun(runId, answered);
+    // Those late fetches keep saving, so the record is written again once they end, after the first write, or it would undercount.
+    if (answered.unfinished > 0) {
+      void firstWrite
+        .catch(() => undefined)
+        .then(() => Promise.all(jobs))
+        .then(() => store.finishRun(runId, summary))
+        .catch((e) => console.error(`Could not update the scheduled run record: ${(e as Error).message}`));
+    }
+    await firstWrite;
     if (summary.backupLinks >= 5 && summary.backupLinks * 2 >= summary.claimed) void alert('backups', `Instagram stats: ${summary.backupLinks} of ${summary.claimed} links needed the backup scrapers in the last scheduled run, which costs several times more per link. The first scraper may have changed or broken.`);
-    return { runId, ...summary };
+    return { runId, ...answered };
   }
 
   /** Whether the scheduled job is running. It says nothing by itself when it stops, so this is how anyone finds out. */
   async function scheduleHealth() {
+    // A wake that crashes never finishes, so only finished runs count. Otherwise a cron failing every time would look healthy.
     const last = await store.lastRun();
     const ageMs = last ? Date.now() - new Date(last.startedAt).getTime() : null;
     const stale = ageMs === null || ageMs > 3 * 60 * 60_000;

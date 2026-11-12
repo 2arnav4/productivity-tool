@@ -36,6 +36,21 @@ create table if not exists instagram_stats_refreshes (
 );
 create index if not exists instagram_stats_refreshes_idx on instagram_stats_refreshes (user_id, plan_id, at);
 
+-- Which links each Refresh has already paid for, so sending the same Refresh again can never pay for a link twice. Goes with its Refresh.
+create table if not exists instagram_stats_refresh_links (
+  refresh_id uuid not null references instagram_stats_refreshes (id) on delete cascade,
+  key text not null,
+  primary key (refresh_id, key)
+);
+
+-- One row per paid fetch started by attaching links (paste or Excel import), for the per-user hourly limit.
+create table if not exists instagram_stats_attach_fetches (
+  id bigint generated always as identity primary key,
+  user_id uuid not null,
+  at timestamptz not null default now()
+);
+create index if not exists instagram_stats_attach_fetches_idx on instagram_stats_attach_fetches (user_id, at);
+
 create table if not exists instagram_stats_runs (
   id bigint generated always as identity primary key,
   started_at timestamptz not null default now(),
@@ -53,13 +68,15 @@ create index if not exists instagram_stats_runs_started_idx on instagram_stats_r
 
 create table if not exists instagram_stats_alerts (kind text primary key, last_sent_at timestamptz not null);
 
-create table if not exists instagram_stats_spend (day date primary key, usd numeric not null default 0); -- PARKED: daily limit
+create table if not exists instagram_stats_spend (day date primary key, usd numeric not null default 0); -- estimated scraper spend per UTC day, for the daily limit
 
 alter table instagram_link_stats enable row level security;
 alter table instagram_stats_refreshes enable row level security;
 alter table instagram_stats_runs enable row level security;
 alter table instagram_stats_alerts enable row level security;
 alter table instagram_stats_spend enable row level security;
+alter table instagram_stats_refresh_links enable row level security;
+alter table instagram_stats_attach_fetches enable row level security;
 
 -- Records a link the first time it's seen. A link that's already known keeps its first time.
 create or replace function instagram_stats_attach(p_links jsonb) returns setof instagram_link_stats
@@ -89,13 +106,22 @@ language sql set search_path = public as $$
      set started_at = now(), claimed_until = now() + make_interval(secs => p_ttl_seconds), claim_token = gen_random_uuid()
    where s.key in (
      select d.key from instagram_link_stats d
-      where d.attached_at <= now() - interval '24 hours'
+      where (d.attached_at <= now() - interval '24 hours'
+             -- never tried yet, for example over the attach limit or a tab closed first: its first fetch shouldn't wait a day
+             or (d.auto_fetches = 0 and d.last_fetched_at is null and d.last_failed_at is null))
         and d.auto_fetches < 2
         and not d.gave_up
         and (d.retry_after is null or d.retry_after <= now())
         and (d.claimed_until is null or d.claimed_until < now())
         and (d.last_fetched_at is null or d.last_fetched_at <= now() - interval '12 hours')
-        and exists (select 1 from media_plan_items i where i.live_links ?| d.aliases) -- a link no longer on a row stops costing money
+        -- A link no longer on a row stops costing money. Only a row's first `quantity` slots count, the same ones the page shows,
+        -- so links left past them (live_links is jsonb any signed-in user can write) are never paid for.
+        and exists (
+          select 1 from media_plan_items i
+           cross join lateral jsonb_array_elements(case when jsonb_typeof(i.live_links) = 'array' then i.live_links else '[]'::jsonb end) with ordinality slot(link, n)
+           where (i.quantity is null or i.quantity < 0 or slot.n <= i.quantity)
+             and jsonb_typeof(slot.link) = 'string'
+             and slot.link #>> '{}' = any(d.aliases))
       order by d.attached_at
       limit p_limit
       for update of d skip locked)
@@ -185,6 +211,7 @@ begin
     if exists (select 1 from instagram_stats_refreshes r where r.id = p_id and r.user_id = p_user and r.plan_id = p_plan)
        and found_at > now() - make_interval(secs => p_resume_seconds) then
       return query select true, found_at, 0;
+      return;
     end if;
     return query select false, found_at, 0;
     return;
@@ -200,7 +227,28 @@ begin
   return query select true, found_at, 0;
 end $$;
 
--- PARKED: daily limit. Nothing calls this unless DAILY_LIMIT_USD is set.
+-- Notes that this Refresh is paying for this link. Says false if it already did, so the link isn't paid for again.
+create or replace function instagram_stats_mark_refreshed(p_refresh uuid, p_key text) returns boolean
+language plpgsql set search_path = public as $$
+begin
+  insert into instagram_stats_refresh_links (refresh_id, key) values (p_refresh, p_key) on conflict do nothing;
+  return found;
+end $$;
+
+-- Uses up one of this user's paid fetches from attaching links, or says false if the hourly limit is used up.
+create or replace function instagram_stats_take_attach_fetch(p_user uuid, p_limit int, p_window_seconds int) returns boolean
+language plpgsql set search_path = public as $$
+declare used int;
+begin
+  perform pg_advisory_xact_lock(hashtext('attach' || p_user::text));
+  delete from instagram_stats_attach_fetches a where a.at < now() - interval '1 day';
+  select count(*) into used from instagram_stats_attach_fetches a where a.user_id = p_user and a.at > now() - make_interval(secs => p_window_seconds);
+  if used >= p_limit then return false; end if;
+  insert into instagram_stats_attach_fetches (user_id) values (p_user);
+  return true;
+end $$;
+
+-- Adds a paid call to today's estimated spend, or refuses if that would pass the daily limit. Atomic, so processes at once can't overshoot.
 create or replace function instagram_stats_reserve_spend(p_usd numeric, p_limit numeric) returns boolean
 language plpgsql set search_path = public as $$
 declare spent numeric;
@@ -222,13 +270,17 @@ begin
 end $$;
 
 -- Only the server's service key. Supabase grants new tables and functions to everyone by default, so this takes that back.
-revoke all on instagram_link_stats, instagram_stats_refreshes, instagram_stats_runs, instagram_stats_alerts, instagram_stats_spend from anon, authenticated;
+revoke all on instagram_link_stats, instagram_stats_refreshes, instagram_stats_runs, instagram_stats_alerts, instagram_stats_spend,
+  instagram_stats_refresh_links, instagram_stats_attach_fetches from anon, authenticated;
 revoke all on function instagram_stats_attach(jsonb), instagram_stats_claim(text, int), instagram_stats_claim_due(int, int), instagram_stats_release(text, uuid),
   instagram_stats_save_fetch(text, uuid, jsonb, text, boolean, jsonb, int), instagram_stats_save_failure(text, uuid, text, boolean, int, int, int),
   instagram_stats_save_suspect(text, uuid, jsonb, jsonb, int, int, text, int), instagram_stats_take_refresh(uuid, uuid, uuid, int, int, int),
-  instagram_stats_reserve_spend(numeric, numeric), instagram_stats_alert_due(text, int) from public, anon, authenticated;
-grant all on instagram_link_stats, instagram_stats_refreshes, instagram_stats_runs, instagram_stats_alerts, instagram_stats_spend to service_role;
+  instagram_stats_reserve_spend(numeric, numeric), instagram_stats_alert_due(text, int),
+  instagram_stats_mark_refreshed(uuid, text), instagram_stats_take_attach_fetch(uuid, int, int) from public, anon, authenticated;
+grant all on instagram_link_stats, instagram_stats_refreshes, instagram_stats_runs, instagram_stats_alerts, instagram_stats_spend,
+  instagram_stats_refresh_links, instagram_stats_attach_fetches to service_role;
 grant execute on function instagram_stats_attach(jsonb), instagram_stats_claim(text, int), instagram_stats_claim_due(int, int), instagram_stats_release(text, uuid),
   instagram_stats_save_fetch(text, uuid, jsonb, text, boolean, jsonb, int), instagram_stats_save_failure(text, uuid, text, boolean, int, int, int),
   instagram_stats_save_suspect(text, uuid, jsonb, jsonb, int, int, text, int), instagram_stats_take_refresh(uuid, uuid, uuid, int, int, int),
-  instagram_stats_reserve_spend(numeric, numeric), instagram_stats_alert_due(text, int) to service_role;
+  instagram_stats_reserve_spend(numeric, numeric), instagram_stats_alert_due(text, int),
+  instagram_stats_mark_refreshed(uuid, text), instagram_stats_take_attach_fetch(uuid, int, int) to service_role;

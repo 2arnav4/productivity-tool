@@ -24,8 +24,8 @@ export async function POST(req: NextRequest) {
   if (problem) return NextResponse.json({ error: problem }, { status: 503 });
   try {
     const summary = await getStatsService().runDue({ limit: LINKS_PER_WAKE, budgetMs: ANSWER_WITHIN_MS });
-    // Fails the curl call when the whole service is out, so hPanel's output shows it.
-    return NextResponse.json(summary, { status: summary.stopped ? 503 : 200 });
+    // Fails the curl call when the whole service is out, so hPanel's output shows it. The daily limit is working as meant, so it isn't a failure.
+    return NextResponse.json(summary, { status: summary.stopped === "service" ? 503 : 200 });
   } catch (err) {
     console.error("live-plan-stats cron error:", err);
     return NextResponse.json({ error: "The scheduled refresh could not run." }, { status: 500 });

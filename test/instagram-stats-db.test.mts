@@ -37,11 +37,23 @@ const fresh = () => {
   service = createStatsService({ store, resolveLink: async () => { throw new Error('no share links here'); }, alert: async (k) => { alerts.push(k); } });
   return service;
 };
-/** Sends one request through the service, the way the route does. */
-const ask = async (s: typeof service, links: string[], since?: string, wait: string[] = []) => {
+const USER = '30000000-0000-4000-8000-0000000000aa';
+const refreshIds = new Map<string, string>(); // One Refresh per start time, so resending a start resends the same Refresh.
+/** A Refresh row the way the route makes one, so what it paid for can be noted against it. */
+const refreshFor = async (since: string) => {
+  if (!refreshIds.has(since)) {
+    const id = crypto.randomUUID();
+    await db.from('instagram_stats_refreshes').insert({ id, user_id: USER, plan_id: PLAN, at: since });
+    refreshIds.set(since, id);
+  }
+  return refreshIds.get(since)!;
+};
+/** Sends one request through the service, the way the route does. Attaching gets a limit no test reaches unless it sets one. */
+const ask = async (s: typeof service, links: string[], since?: string, wait: string[] = [], attachLimit = 1000) => {
   const lines: any[] = [];
   if (since) await new Promise((r) => setTimeout(r, 5)); // Anything saved before a Refresh began must be older than it.
-  await s.answerLinks({ links, wait, since, isGone: () => false, send: (l) => lines.push(l) });
+  const payer = since ? { refresh: { id: await refreshFor(since), since } } : { attach: { userId: USER, limit: attachLimit, windowSeconds: 3600 } };
+  await s.answerLinks({ links, wait, payer, isGone: () => false, send: (l) => lines.push(l) });
   return lines;
 };
 const row = async (k = CODE) => (await db.from('instagram_link_stats').select('*').eq('key', k).single()).data as any;
@@ -68,6 +80,9 @@ beforeEach(async () => {
   await db.from('instagram_link_stats').delete().like('url', '%');
   await db.from('instagram_stats_refreshes').delete().gt('at', '2000-01-01');
   await db.from('instagram_stats_runs').delete().gt('started_at', '2000-01-01');
+  await db.from('instagram_stats_spend').delete().gt('day', '2000-01-01');
+  await db.from('instagram_stats_attach_fetches').delete().gt('at', '2000-01-01');
+  refreshIds.clear();
   fresh();
 });
 after(async () => {
@@ -78,6 +93,8 @@ after(async () => {
   await db.from('instagram_link_stats').delete().like('url', '%');
   await db.from('instagram_stats_runs').delete().gt('started_at', '2000-01-01');
   await db.from('instagram_stats_refreshes').delete().gt('at', '2000-01-01');
+  await db.from('instagram_stats_spend').delete().gt('day', '2000-01-01');
+  await db.from('instagram_stats_attach_fetches').delete().gt('at', '2000-01-01');
   net?.close();
   globalThis.fetch = realFetch;
 });
@@ -415,6 +432,9 @@ test('a wake answers on time even if a fetch is still running', { skip }, async 
   assert.ok(Date.now() - started < 280);
   assert.equal(run.unfinished, 1);
   await new Promise((r) => setTimeout(r, 400));
+  // The fetch saved after the answer, so the run record must say so.
+  const record = (await db.from('instagram_stats_runs').select('saved, unfinished').eq('id', run.runId).single()).data as any;
+  assert.deepEqual([record.saved, record.unfinished], [1, 0]);
 });
 
 test('a backlog waits for the next wake', { skip }, async () => {
@@ -491,4 +511,121 @@ test('a profile link is refused and creates nothing', { skip }, async () => {
   assert.equal(line.unusable, true);
   assert.equal(paid(), 0);
   assert.ok(UnusableLink);
+});
+
+test('a saved link is still found by a written form with a comma, brace or quote', { skip }, async () => {
+  await store.attach([{ key: CODE, url: REEL, alias: REEL }]);
+  const odd = `${REEL}?a={"b",c}\\d`;
+  await set({ aliases: [REEL, odd] });
+  const found = await store.find([], [odd]);
+  assert.deepEqual(found.map((r) => r.key), [CODE]);
+});
+
+test('resuming a Refresh answers with one row, not two', { skip }, async () => {
+  const args = { p_id: '60000000-0000-4000-8000-000000000001', p_user: '30000000-0000-4000-8000-000000000001', p_plan: PLAN, p_limit: 6, p_window_seconds: 3600, p_resume_seconds: 900 };
+  assert.equal((await db.rpc('instagram_stats_take_refresh', args)).data.length, 1);
+  const again = await db.rpc('instagram_stats_take_refresh', args);
+  assert.deepEqual(again.data.map((r: any) => r.allowed), [true]);
+});
+
+test('a big plan still reads its saved stats, in parts that fit in a URL', { skip }, async () => {
+  await store.attach([{ key: CODE, url: REEL, alias: REEL }]);
+  const share = (i: number) => `https://www.instagram.com/share/reel/${'x'.repeat(60)}${i}/?igsh=${'y'.repeat(20)}`;
+  const aliases = [...Array.from({ length: 500 }, (_, i) => share(i)), REEL, 'z'.repeat(20_000)];
+  const keys = [...Array.from({ length: 2000 }, (_, i) => `K${i}`), CODE];
+  assert.deepEqual((await store.find(keys, [])).map((r) => r.key), [CODE]);
+  assert.deepEqual((await store.find([], aliases)).map((r) => r.key), [CODE]);
+});
+
+test('a wake that never finished does not count as the cron running', { skip }, async () => {
+  await store.attach([{ key: CODE, url: REEL, alias: REEL }]);
+  await db.from('instagram_stats_runs').insert({ started_at: new Date().toISOString() });
+  assert.equal((await service.scheduleHealth()).stale, true);
+  const id = await store.startRun();
+  await store.finishRun(id, { claimed: 0, saved: 0, failed: 0, held: 0, unfinished: 0, backupLinks: 0, sources: {}, stopped: null });
+  assert.equal((await service.scheduleHealth()).stale, false);
+});
+
+test('the daily limit is on by default: past it nothing is paid, no link is blamed, and admins hear', { skip }, async () => {
+  await db.from('instagram_stats_spend').insert({ day: new Date().toISOString().slice(0, 10), usd: 0.9995 });
+  checked();
+  const [line] = await ask(service, [REEL]);
+  assert.equal(paid(), 0);
+  assert.match(line.error, /Daily limit reached/);
+  assert.ok(alerts.includes('daily-limit'));
+  const saved = await row();
+  assert.deepEqual([saved.claim_token, saved.last_failed_at, saved.fail_count], [null, null, 0]);
+});
+
+test('a resent Refresh never pays again for a link whose numbers were held', { skip }, async () => {
+  checked();
+  await ask(service, [REEL]);
+  const since = refresh();
+  checked([{ ...CHECKED, likes: 10 }]);
+  const [held] = await ask(service, [REEL], since);
+  assert.match(held.warning, /changed sharply/);
+  assert.equal(paid(), 2);
+  for (let i = 0; i < 3; i++) {
+    const [again] = await ask(fresh(), [REEL], since);
+    assert.equal(again.metrics.likes.value, 127);
+    assert.ok(again.warning);
+  }
+  assert.equal(paid(), 2);
+  assert.equal((await row()).held_count, 1);
+  // A new Refresh may still try it.
+  checked([{ ...CHECKED, likes: 10 }]);
+  await ask(fresh(), [REEL], refresh());
+  assert.equal(paid(), 3);
+});
+
+test('attaching pays for at most the hourly limit per user, and the scheduled job fetches the rest soon', { skip }, async () => {
+  const links = ['AAAAAAAAAAA', 'BBBBBBBBBBB', 'CCCCCCCCCCC'].map((c) => `https://www.instagram.com/reel/${c}/`);
+  await planRow(links);
+  actors().intercept({ path: /reel-views-checker/, method: 'POST' }).reply(200, ({ body }: { body: string }) => JSON.parse(body).urls.map((u: string) => ({ ...CHECKED, shortCode: u.split('/').filter(Boolean).pop() }))).persist();
+  const lines = await ask(service, links, undefined, [], 1);
+  assert.equal(lines.filter((l) => l.done && l.metrics?.views).length, 1);
+  assert.equal(lines.filter((l) => /fetched automatically/.test(l.error ?? '')).length, 2);
+  const queued = await db.from('instagram_link_stats').select('claim_token, last_failed_at').is('last_fetched_at', null);
+  assert.deepEqual(queued.data, [{ claim_token: null, last_failed_at: null }, { claim_token: null, last_failed_at: null }]);
+  // Another ask in the same hour doesn't pay either.
+  await ask(fresh(), links, undefined, [], 1);
+  assert.equal((await db.from('instagram_stats_attach_fetches').select('id')).data!.length, 1);
+  const run = await wake();
+  assert.deepEqual([run.claimed, run.saved], [2, 2]);
+  assert.equal((await row('BBBBBBBBBBB')).history[0].kind, 'first');
+  // Fetched once, so now it waits for its 24-hour fetch.
+  assert.equal((await wake()).claimed, 0);
+});
+
+test('a link whose attach fetch failed is not picked up early by the scheduled job', { skip }, async () => {
+  await planRow([REEL]);
+  checked({ error: { message: 'no' } }, 400);
+  await ask(service, [REEL]);
+  assert.ok((await row()).last_failed_at);
+  await set({ retry_after: null });
+  assert.equal((await wake()).claimed, 0);
+});
+
+test('the attach limit counts per user and holds when many ask at once', { skip }, async () => {
+  const other = '30000000-0000-4000-8000-0000000000bb';
+  const results = await Promise.all(Array.from({ length: 30 }, () => store.takeAttachFetch(USER, 10, 3600)));
+  assert.equal(results.filter(Boolean).length, 10);
+  assert.equal(await store.takeAttachFetch(other, 10, 3600), true);
+});
+
+test('the scheduled job never pays for a link past a row\'s quantity, the slots the page hides', { skip }, async () => {
+  const hidden = 'https://www.instagram.com/reel/HHHHHHHHHHH/';
+  await db.from('media_plan_items').insert({ plan_id: PLAN, handle_name: 'test_row', quantity: 1, live_links: [REEL, hidden] });
+  // Not due(), which adds a row of its own for each link.
+  for (const [k, u] of [[CODE, REEL], ['HHHHHHHHHHH', hidden]]) {
+    await store.attach([{ key: k, url: u, alias: u }]);
+    await set({ attached_at: hoursAgo(25) }, k);
+  }
+  actors().intercept({ path: /reel-views-checker/, method: 'POST' }).reply(200, ({ body }: { body: string }) => JSON.parse(body).urls.map((u: string) => ({ ...CHECKED, shortCode: u.split('/').filter(Boolean).pop() }))).persist();
+  const run = await wake();
+  assert.equal(run.claimed, 1);
+  assert.equal((await row('HHHHHHHHHHH')).auto_fetches, 0);
+  // A bad value in a slot doesn't break the query for everyone else.
+  await db.from('media_plan_items').insert({ plan_id: PLAN, handle_name: 'bad_row', quantity: 3, live_links: [{ x: 1 }, 5, null] });
+  assert.equal((await wake()).claimed, 0);
 });

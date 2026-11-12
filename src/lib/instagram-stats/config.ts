@@ -17,7 +17,7 @@ export const config = {
   // PARKED: scrapecreators
   // scrapeCreatorsKey: key('SCRAPECREATORS_KEY'),
   retryFailedMs: setting('RETRY_FAILED_MS', 30 * 60_000), // First wait after a failed fetch. It doubles each time.
-  dailyLimitUsd: setting('DAILY_LIMIT_USD', Infinity), // PARKED: daily limit. Off unless this is set. Estimated spend per UTC day before fetching stops.
+  dailyLimitUsd: setting('DAILY_LIMIT_USD', 1), // Estimated spend per UTC day before all fetching stops. On by default, so a bug or misuse can't spend all day.
   startWindowMs: setting('START_WINDOW_MS', 20_000), // How long one request keeps starting new links.
   responseMs: setting('RESPONSE_MS', 100_000), // A request answers by then, because hosts cut requests at 120 seconds. Work carries on.
   // PARKED: followers (only the account lookups read this)

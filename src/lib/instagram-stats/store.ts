@@ -35,6 +35,9 @@ export interface LinkRecord {
 }
 
 export interface NewLink { key: string; url: string; alias: string }
+const URL_BUDGET = 6000; // Characters of values per read, well under the 16 KB URL limit.
+const MAX_ALIAS_LENGTH = 2048;
+
 export interface RunSummary { claimed: number; saved: number; failed: number; held: number; unfinished: number; backupLinks: number; sources: Record<string, number>; stopped: string | null }
 export interface LastRun { startedAt: string; finishedAt: string | null; stopped: string | null }
 export interface RefreshTicket { allowed: boolean; at: string | null; retrySeconds: number }
@@ -57,8 +60,12 @@ export interface StatsStore {
   saveFailure(key: string, token: string, message: string, opts: { giveUp?: boolean; waitSeconds?: number; baseSeconds: number }): Promise<boolean>;
   /** Notes numbers that changed sharply. Saved numbers stay, and it counts as an attempt. */
   saveSuspect(key: string, token: string, numbers: Record<string, number | null>, kind: FetchKind, opts: { baseSeconds: number; message: string }): Promise<boolean>;
-  /** PARKED: daily limit. Adds to today's estimated spend, unless that would pass the limit. */
+  /** Adds to today's estimated spend, unless that would pass the limit. */
   reserveSpend(usd: number, limitUsd: number): Promise<boolean>;
+  /** Notes that this Refresh pays for this link. False if it already did, so a resent Refresh can't pay twice. */
+  markRefreshed(refreshId: string, key: string): Promise<boolean>;
+  /** Uses up one paid fetch started by attaching links, or false if this user's hourly limit is used up. */
+  takeAttachFetch(userId: string, limit: number, windowSeconds: number): Promise<boolean>;
   /** Uses up one Refresh. Sending the same id again resumes it without using another. */
   takeRefresh(id: string, userId: string, planId: string, limit: number, windowSeconds: number, resumeSeconds: number): Promise<RefreshTicket>;
   startRun(): Promise<number>;
@@ -99,6 +106,23 @@ export function createSupabaseStore(db: SupabaseClient): StatsStore {
     at: new Date().toISOString(), kind, complete, numbers, sources, ...(held && { held }),
   });
 
+  // overlaps() joins values without quotes, so a link with a comma, brace or quote breaks the filter. Each value is quoted here.
+  // Every value goes into the request URL, and servers refuse long URLs (Node's limit is 16 KB), so big plans are read in parts.
+  const byUrlSize = (values: string[]) => {
+    const parts: string[][] = [];
+    let part: string[] = [];
+    let size = 0;
+    for (const v of values) {
+      const cost = encodeURIComponent(v).length + 6;
+      if (part.length && size + cost > URL_BUDGET) { parts.push(part); part = []; size = 0; }
+      part.push(v);
+      size += cost;
+    }
+    if (part.length) parts.push(part);
+    return parts;
+  };
+  const pgArray = (values: string[]) => `{${values.map((v) => `"${v.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`).join(',')}}`;
+
   return {
     async attach(links) {
       if (!links.length) return [];
@@ -107,14 +131,15 @@ export function createSupabaseStore(db: SupabaseClient): StatsStore {
     async find(keys, aliases) {
       if (!keys.length && !aliases.length) return [];
       const found: Row[] = [];
-      if (keys.length) {
-        const { data, error } = await db.from('instagram_link_stats').select('*').in('key', keys);
-        if (error) throw new Error(error.message);
+      for (const part of byUrlSize(keys)) {
+        const { data, error } = await db.from('instagram_link_stats').select('*').in('key', part);
+        if (error) throw new Error(error.message || `Could not read saved stats (${error.code ?? 'no code'})`);
         found.push(...(data as Row[]));
       }
-      if (aliases.length) {
-        const { data, error } = await db.from('instagram_link_stats').select('*').overlaps('aliases', aliases);
-        if (error) throw new Error(error.message);
+      // A link longer than any real one can't match a saved form, and would only make the request too long.
+      for (const part of byUrlSize(aliases.filter((a) => a.length <= MAX_ALIAS_LENGTH))) {
+        const { data, error } = await db.from('instagram_link_stats').select('*').filter('aliases', 'ov', pgArray(part));
+        if (error) throw new Error(error.message || `Could not read saved stats (${error.code ?? 'no code'})`);
         for (const row of data as Row[]) if (!found.some((f) => f.key === row.key)) found.push(row);
       }
       return found.map(toRecord);
@@ -148,6 +173,12 @@ export function createSupabaseStore(db: SupabaseClient): StatsStore {
     reserveSpend(usd, limitUsd) {
       return call<boolean>('instagram_stats_reserve_spend', { p_usd: usd, p_limit: limitUsd });
     },
+    markRefreshed(refreshId, key) {
+      return call<boolean>('instagram_stats_mark_refreshed', { p_refresh: refreshId, p_key: key });
+    },
+    takeAttachFetch(userId, limit, windowSeconds) {
+      return call<boolean>('instagram_stats_take_attach_fetch', { p_user: userId, p_limit: limit, p_window_seconds: windowSeconds });
+    },
     async takeRefresh(id, userId, planId, limit, windowSeconds, resumeSeconds) {
       const rows = await call<{ allowed: boolean; at: string | null; retry_seconds: number }[]>('instagram_stats_take_refresh', {
         p_id: id, p_user: userId, p_plan: planId, p_limit: limit, p_window_seconds: windowSeconds, p_resume_seconds: resumeSeconds,
@@ -167,7 +198,7 @@ export function createSupabaseStore(db: SupabaseClient): StatsStore {
       await db.from('instagram_stats_runs').delete().lt('started_at', new Date(Date.now() - RUNS_KEPT_DAYS * 86_400_000).toISOString());
     },
     async lastRun() {
-      const { data, error } = await db.from('instagram_stats_runs').select('started_at, finished_at, stopped').order('started_at', { ascending: false }).limit(1);
+      const { data, error } = await db.from('instagram_stats_runs').select('started_at, finished_at, stopped').not('finished_at', 'is', null).order('started_at', { ascending: false }).limit(1);
       if (error) throw new Error(error.message);
       const row = (data as { started_at: string; finished_at: string | null; stopped: string | null }[])[0];
       return row ? { startedAt: row.started_at, finishedAt: row.finished_at, stopped: row.stopped } : null;
