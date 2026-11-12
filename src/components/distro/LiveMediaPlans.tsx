@@ -129,7 +129,7 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
         ...b,
         media_plans: (b.media_plans || [])
           .filter(p => (p as unknown as { source?: string }).source === "upload" && (p.media_plan_items || []).length > 0)
-          .map(p => ({ ...p, media_plan_items: p.media_plan_items.map(i => ({ ...i, live_links: Array.isArray(i.live_links) ? i.live_links : [] })) })),
+          .map(p => ({ ...p, media_plan_items: p.media_plan_items.map(i => ({ ...i, live_links: Array.isArray(i.live_links) ? (i.live_links as unknown[]).map(l => (typeof l === "string" ? l : "")) : [] })) })),
       }))
       .filter(b => b.media_plans.length > 0);
     setBriefs(list);

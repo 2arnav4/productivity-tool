@@ -93,7 +93,7 @@ export default function MediaPlanUpload({ ensureBrief, onSaved }: Props) {
       setError("This brief already has a plan with verified or paid line items, so it can't be replaced. Update those rows in Live Media Plans instead.");
       return;
     }
-    if (priorItems.some(i => (i.live_links || []).some(Boolean)) &&
+    if (priorItems.some(i => Array.isArray(i.live_links) && i.live_links.some(Boolean)) &&
         !confirm("The existing uploaded plan has live links filled in. Replacing it will remove them. Continue?")) {
       setSaving(false);
       return;

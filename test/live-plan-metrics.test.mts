@@ -1,7 +1,7 @@
 // A row's totals, as the table and both exports show them.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { rowStat, planExportRows, lineToMetrics } from '../src/lib/live-plan-metrics';
+import { rowStat, planExportRows, lineToMetrics, currentLinks } from '../src/lib/live-plan-metrics';
 
 const A = 'https://www.instagram.com/reel/AAAAAAAAAAA/';
 const B = 'https://www.instagram.com/p/BBBBBBBBBBB/';
@@ -54,4 +54,18 @@ test('the export follows the table: order, columns, blanks for missing, and a re
   assert.deepEqual(rows.map((r) => r['Page / Creator']), ['b', 'c', 'a']);
   assert.deepEqual(Object.keys(rows[0]), ['#', 'Page / Creator', 'Followers', 'Deliv.', 'Payout', 'Live Links', 'Views', 'Likes', 'Comments', 'Shares', 'Reposts', 'Engagement', 'Verified', 'Paid']);
   assert.deepEqual([rows[2].Followers, rows[2].Reposts, rows[2]['Live Links'], rows[0].Views], [0, 0, `${A}\n${B}`, '']);
+});
+
+test('a live_links value that is not a text link is skipped, not a crash', () => {
+  const bad = { live_links: [A, 123, null, { x: 1 }, '   '] as never, metrics: { [A]: full } as never };
+  assert.deepEqual(currentLinks(bad), [A]);
+  assert.equal(rowStat(bad, 'views').value, 1000);
+  assert.equal(currentLinks({ live_links: 'not a list' as never }).length, 0);
+});
+
+test('only the first quantity links count, since only those slots can be seen or edited', () => {
+  const r = { live_links: [A, B], quantity: 1, metrics: { [A]: full, [B]: { ...full, key: 'B' } } as never };
+  assert.deepEqual(currentLinks(r), [A]);
+  assert.equal(rowStat(r, 'views').value, 1000);
+  assert.deepEqual(currentLinks({ live_links: [A, B] }), [A, B]);
 });

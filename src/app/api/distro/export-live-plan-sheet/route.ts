@@ -32,8 +32,16 @@ async function withStats(items: Parameters<typeof planExportRows>[0]) {
   return items.map(i => ({ ...i, metrics }));
 }
 
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 export async function POST(req: NextRequest) {
   try {
+    // Cookies travel with cross-site requests in some cases, so only this site's own pages may start an export.
+    const site = req.headers.get("sec-fetch-site");
+    if (site && site !== "same-origin") return NextResponse.json({ error: "This only accepts requests from the dashboard." }, { status: 403 });
+    // A plain form from another site can't send JSON, which covers older browsers that don't send the header above.
+    if (!(req.headers.get("content-type") ?? "").toLowerCase().startsWith("application/json")) return NextResponse.json({ error: "Send JSON." }, { status: 415 });
+
     const supabase = await createServerSupabaseClient();
     const { data: { user } } = await supabase.auth.getUser();
     if (!user) return NextResponse.json({ error: "Not signed in." }, { status: 401 });
@@ -45,6 +53,7 @@ export async function POST(req: NextRequest) {
     const body = await req.json().catch(() => null) as { planId?: unknown } | null;
     const planId = body?.planId;
     if (typeof planId !== "string" || !planId) return NextResponse.json({ error: "Missing plan." }, { status: 400 });
+    if (!UUID.test(planId)) return NextResponse.json({ error: "Invalid plan." }, { status: 400 });
 
     // Rows come from the database, never from the browser
     const { data: plan, error: planError } = await supabase

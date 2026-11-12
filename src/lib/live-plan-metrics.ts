@@ -50,6 +50,7 @@ export function lineToMetrics(line: StatsLine): LinkMetrics {
 
 interface RowWithLinks {
   live_links?: string[] | null;
+  quantity?: number | null;
   metrics?: MetricsByLink | null;
 }
 
@@ -63,8 +64,13 @@ interface ExportRow extends RowWithLinks {
   paid: boolean;
 }
 
-export const currentLinks = (row: RowWithLinks) =>
-  (Array.isArray(row.live_links) ? row.live_links : []).filter(l => l && l.trim());
+// live_links is jsonb that any signed-in user can write, so anything that isn't a text link is skipped rather than crashing the plan.
+// Only the row's first `quantity` slots are shown and editable, so links past them are left out of fetches and totals.
+export const currentLinks = (row: RowWithLinks) => {
+  const all = Array.isArray(row.live_links) ? (row.live_links as unknown[]) : [];
+  const slots = typeof row.quantity === "number" && row.quantity >= 0 ? all.slice(0, row.quantity) : all;
+  return slots.filter((l): l is string => typeof l === "string" && l.trim() !== "");
+};
 
 /** A row's links, one per post: the same post pasted twice, even as /p/ and /reel/, counts once. */
 function rowPosts(row: RowWithLinks) {
