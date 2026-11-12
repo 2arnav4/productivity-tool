@@ -32,7 +32,7 @@ export interface StatsLine {
   link: string;
   url?: string;
   key?: string;
-  metrics?: Record<string, { value: number | null; note?: string }>;
+  metrics?: Record<string, { value: number | null; note?: string; hidden?: boolean; notShown?: boolean }>;
   done: boolean;
   savedAt?: string;
   warning?: string;
@@ -43,9 +43,19 @@ export interface StatsLine {
 const plainError = (report: Report) => (report.budgetStopped ? LIMIT_REACHED : report.notFound ? NOT_FOUND : report.serviceDown ? SERVICE_DOWN : COULD_NOT_READ);
 const when = (at?: string | null) => (at ? new Date(at).toLocaleString('en-GB', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit', timeZone: 'Asia/Kolkata' }) : 'an earlier fetch');
 
+const VIDEO_TYPES = ['clips', 'reel', 'video', 'igtv'];
+const NOT_ON_PHOTOS = ['views', 'shares', 'reposts'];
+/** A photo or carousel, known from the reply. Unknown type counts as not a photo, so a real gap is never passed off as normal. */
+const isPhotoPost = (report: Report) => report.link.kind === 'post' && !!report.type && !VIDEO_TYPES.includes(report.type.toLowerCase());
+
 /** One link's numbers, in the shape the table reads. Details of what failed go to the log: a person only needs to know what to do. */
 function toLine(raw: string, report: Report, done: boolean, key: string | undefined, extra: { savedAt?: string | null; warning?: string } = {}): StatsLine {
-  const metrics = Object.fromEntries(TABLE_METRICS.filter((m) => report.metrics[m]).map((m) => [m, { value: report.metrics[m].value, note: report.metrics[m].note }]));
+  const metrics = Object.fromEntries(TABLE_METRICS.filter((m) => report.metrics[m]).map((m) => {
+    const c = report.metrics[m];
+    // Instagram doesn't show views, shares or reposts on photos and carousels, so their gap is normal there, not our fault.
+    const notShown = c.value === null && !c.hidden && NOT_ON_PHOTOS.includes(m) && isPhotoPost(report);
+    return [m, { value: c.value, note: c.note, ...(c.hidden && { hidden: true }), ...(notShown && { notShown: true }) }];
+  }));
   const hasNumber = Object.values(metrics).some((m) => m.value !== null);
   return { link: raw, url: report.link.url, key, metrics, done, ...(extra.savedAt && { savedAt: extra.savedAt }), ...(done && extra.warning && { warning: extra.warning }), ...(done && !hasNumber && { error: plainError(report) }) };
 }

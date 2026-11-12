@@ -135,6 +135,28 @@ test('the first fetch counts as automatic, a real 0 stays 0, and reopening costs
   assert.equal(again.metrics.reposts.value, 0);
 });
 
+test('a count the owner hid is flagged as hidden, fresh and when read back from storage', { skip }, async () => {
+  checked([{ ...CHECKED, likes: 0, likesHidden: true }]);
+  const [line] = await ask(service, [REEL]);
+  assert.equal(line.metrics.likes.value, null);
+  assert.equal(line.metrics.likes.hidden, true);
+  assert.equal(line.metrics.views.hidden, true); // Hiding likes on Instagram hides the view count too.
+  assert.equal(line.metrics.comments.hidden, undefined);
+  const [again] = await ask(fresh(), [REEL]);
+  assert.ok(again.savedAt);
+  assert.equal(again.metrics.likes.hidden, true);
+});
+
+test('views, shares and reposts missing on a photo are marked as not shown', { skip }, async () => {
+  const PHOTO = `https://www.instagram.com/p/${CODE}/`;
+  checked([{ ...CHECKED, type: 'photo', productType: undefined, views: undefined, shares: undefined, reposts: undefined }]);
+  const line = (await ask(service, [PHOTO])).at(-1); // The final line: earlier ones are partial while the fetch runs.
+  assert.equal(line.done, true);
+  assert.equal(line.metrics.likes.value, 127);
+  for (const m of ['views', 'shares', 'reposts']) assert.equal(line.metrics[m]?.notShown, true, m);
+  assert.equal(line.metrics.likes.notShown, undefined);
+});
+
 test('no scraper name reaches a person, whatever fails', { skip }, async () => {
   checked({ error: { message: 'apify token SECRET-APIFY' } }, 400);
   actors().intercept({ path: /instagram-scraper/, method: 'POST' }).reply(400, { error: { message: 'apify broke' } });

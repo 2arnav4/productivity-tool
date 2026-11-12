@@ -1,7 +1,7 @@
 // A row's totals, as the table and both exports show them.
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { rowStat, planExportRows, lineToMetrics, currentLinks } from '../src/lib/live-plan-metrics';
+import { rowStat, planExportRows, lineToMetrics, currentLinks, missingKind } from '../src/lib/live-plan-metrics';
 
 const A = 'https://www.instagram.com/reel/AAAAAAAAAAA/';
 const B = 'https://www.instagram.com/p/BBBBBBBBBBB/';
@@ -9,7 +9,7 @@ const row = (live_links: string[], metrics: object) => ({ live_links, metrics: m
 const full = { key: 'A', views: 1000, likes: 100, comments: 10, shares: 5, reposts: 1 };
 
 test('a row with no stats shows why', () => {
-  assert.deepEqual(rowStat(row([A], {}), 'views'), { value: null, reason: 'Stats not fetched yet' });
+  assert.deepEqual(rowStat(row([A], {}), 'views'), { value: null, reason: 'Stats not fetched yet', kind: 'retry' });
 });
 test('a real 0 stays 0, and missing is never counted as 0', () => {
   assert.equal(rowStat(row([A], { [A]: { ...full, shares: 0 } }), 'shares').value, 0);
@@ -68,4 +68,44 @@ test('only the first quantity links count, since only those slots can be seen or
   assert.deepEqual(currentLinks(r), [A]);
   assert.equal(rowStat(r, 'views').value, 1000);
   assert.deepEqual(currentLinks({ live_links: [A, B] }), [A, B]);
+});
+
+test('each missing stat gets the kind its icon shows, and the reason comes from the same link', () => {
+  const line = (metrics: object, extra: object = {}) => lineToMetrics({ link: A, done: true, metrics, ...extra } as never);
+  // The owner hid likes: flagged by the server, even if the wording changes.
+  const hid = row([A], { [A]: line({ likes: { value: null, note: 'the owner has hidden the like count', hidden: true } }) });
+  assert.deepEqual(rowStat(hid, 'likes'), { value: null, reason: 'the owner has hidden the like count', kind: 'hidden' });
+  // Views on a photo or carousel: Instagram doesn't show them.
+  const photo = row([A], { [A]: line({ views: { value: null, note: 'no views returned. Sources only report views on reels and videos' } }) });
+  assert.equal(rowStat(photo, 'views').kind, 'na');
+  // Shares on a photo: the server marks it, so the wording doesn't matter.
+  const photoShares = row([A], { [A]: line({ shares: { value: null, note: "our sources didn't return the share count for this post", notShown: true } }) });
+  assert.equal(rowStat(photoShares, 'shares').kind, 'na');
+  // The post is gone: a real failure.
+  const gone = row([A], { [A]: line({}, { error: 'Post not found. May be private or deleted' }) });
+  assert.equal(rowStat(gone, 'views').kind, 'failed');
+  // A link that can never give stats is a failure, whatever its wording.
+  const bad = row([A], { [A]: line({}, { error: 'This is a Reels audio page. Open the reel and copy its own link.', unusable: true }) });
+  assert.equal(rowStat(bad, 'likes').kind, 'failed');
+  // Our side: a source failed, or the daily limit. Retrying or waiting helps.
+  const ours = row([A], { [A]: line({ shares: { value: null, note: 'could not be checked, because a source failed' } }) });
+  assert.equal(rowStat(ours, 'shares').kind, 'retry');
+  const limit = row([A], { [A]: line({}, { error: 'Daily limit reached. Try after 5:30 AM' }) });
+  assert.equal(rowStat(limit, 'views').kind, 'retry');
+  // Engagement with no parts follows likes, like its reason does.
+  assert.equal(rowStat(hid, 'engagement').kind, 'hidden');
+  // A number never carries a kind, and a real 0 stays a number.
+  assert.equal(rowStat(row([A], { [A]: { ...full, shares: 0 } }), 'shares').kind, undefined);
+});
+
+test('wording nobody planned for is never shown as a red failure', () => {
+  assert.equal(missingKind('some new message from a source'), 'retry');
+  assert.equal(missingKind(undefined), 'retry');
+  assert.equal(missingKind('not applicable: this is a profile link'), 'na');
+});
+
+test('a row with no live link shows a plain dash, not a waiting icon', () => {
+  assert.deepEqual(rowStat(row([], {}), 'views'), { value: null, reason: 'No live link yet' });
+  assert.deepEqual(rowStat(row([], {}), 'engagement'), { value: null, reason: 'No live link yet', kind: undefined });
+  assert.equal(rowStat({ live_links: [A], quantity: 0, metrics: {} as never }, 'likes').kind, undefined);
 });

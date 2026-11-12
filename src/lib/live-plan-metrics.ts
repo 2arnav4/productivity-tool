@@ -13,13 +13,35 @@ export type StatKey = (typeof STATS)[number]["key"];
 type CountedKey = Exclude<StatKey, "engagement">;
 const ENGAGEMENT_PARTS: CountedKey[] = ["likes", "comments", "shares"];
 const NOT_FETCHED = "Stats not fetched yet";
+const NO_LINK = "No live link yet";
+
+/**
+ * Why a stat has no number, so the table can show a different icon for each case.
+ * - failed: the link itself can't give stats (post not found, private or deleted, not a post link). Retrying won't help.
+ * - hidden: the owner hid this count on Instagram.
+ * - na: Instagram doesn't show this count for this kind of post (views on photos and carousels).
+ * - retry: on our side or still waiting: not fetched yet, a source failed, daily limit, held numbers. Retrying or waiting can help.
+ */
+export type MissingKind = "failed" | "hidden" | "na" | "retry";
+
+// Matched against the server's own wording. Anything not matched counts as "retry", so a new message never shows as a red failure by mistake.
+const OWNER_HID = /owner has hidden/i;
+const NOT_SHOWN_FOR_TYPE = /^not applicable|only report views on reels and videos/i;
+const POST_GONE = /^post not found/i;
+
+export function missingKind(reason: string | undefined, flags: { hidden?: boolean; notShown?: boolean; unusable?: boolean } = {}): MissingKind {
+  if (flags.hidden || (reason && OWNER_HID.test(reason))) return "hidden";
+  if (flags.notShown || (reason && NOT_SHOWN_FOR_TYPE.test(reason))) return "na";
+  if (flags.unusable || (reason && POST_GONE.test(reason))) return "failed";
+  return "retry";
+}
 
 /** One line from the stats route. */
 export interface StatsLine {
   link: string;
   url?: string;
   key?: string;
-  metrics?: Partial<Record<CountedKey, { value: number | null; note?: string }>>;
+  metrics?: Partial<Record<CountedKey, { value: number | null; note?: string; hidden?: boolean; notShown?: boolean }>>;
   done?: boolean;
   savedAt?: string;
   warning?: string;
@@ -31,6 +53,8 @@ export interface StatsLine {
 export type LinkMetrics = Partial<Record<CountedKey, number | null>> & {
   key?: string; // The post it points to, so two forms of one link count once.
   notes?: Partial<Record<CountedKey, string>>;
+  hidden?: Partial<Record<CountedKey, true>>; // Counts the owner hid on Instagram.
+  notShown?: Partial<Record<CountedKey, true>>; // Counts Instagram doesn't show for this type of post.
   error?: string; // Nothing could be read.
   warning?: string; // Numbers are shown, but something about them isn't current.
   unusable?: boolean; // Retrying can't help.
@@ -41,9 +65,11 @@ export type MetricsByLink = Record<string, LinkMetrics>;
 
 export function lineToMetrics(line: StatsLine): LinkMetrics {
   const out: LinkMetrics = { key: line.key, notes: {}, error: line.error, warning: line.warning, unusable: line.unusable, fetched_at: line.savedAt };
-  for (const [name, count] of Object.entries(line.metrics ?? {}) as [CountedKey, { value: number | null; note?: string }][]) {
+  for (const [name, count] of Object.entries(line.metrics ?? {}) as [CountedKey, { value: number | null; note?: string; hidden?: boolean; notShown?: boolean }][]) {
     out[name] = count.value;
     if (count.note) out.notes![name] = count.note;
+    if (count.hidden) (out.hidden ??= {})[name] = true;
+    if (count.notShown) (out.notShown ??= {})[name] = true;
   }
   return out;
 }
@@ -87,11 +113,11 @@ function rowPosts(row: RowWithLinks) {
 }
 
 /** A row's total for one stat across its current live links. A real 0 stays 0, and missing is never counted as 0. */
-export function rowStat(row: RowWithLinks, key: StatKey): { value: number | null; reason?: string; partial?: boolean } {
+export function rowStat(row: RowWithLinks, key: StatKey): { value: number | null; reason?: string; partial?: boolean; kind?: MissingKind } {
   if (key === "engagement") {
     const parts = ENGAGEMENT_PARTS.map(k => ({ k, stat: rowStat(row, k) }));
     const counted = parts.filter(p => p.stat.value !== null);
-    if (!counted.length) return { value: null, reason: parts[0].stat.reason || NOT_FETCHED };
+    if (!counted.length) return { value: null, reason: parts[0].stat.reason || NOT_FETCHED, kind: parts[0].stat.kind };
     const incomplete = parts.filter(p => p.stat.value === null || p.stat.partial).map(p => p.k);
     return {
       value: counted.reduce((sum, p) => sum + (p.stat.value as number), 0),
@@ -100,6 +126,8 @@ export function rowStat(row: RowWithLinks, key: StatKey): { value: number | null
     };
   }
   const posts = rowPosts(row);
+  // Nothing pasted yet: there's nothing to fetch or retry, so no icon, just a plain dash.
+  if (!posts.length) return { value: null, reason: NO_LINK };
   const values = posts.map(p => p.m?.[key]).filter((v): v is number => typeof v === "number");
   const flagged = posts.map(p => p.m?.warning).filter(Boolean).join(" ");
   if (values.length > 0) {
@@ -109,8 +137,12 @@ export function rowStat(row: RowWithLinks, key: StatKey): { value: number | null
     const reason = [missing > 0 ? `${missing} of ${posts.length} links missing` : "", flagged].filter(Boolean).join(". ");
     return missing > 0 || flagged ? { value, partial: true, reason } : { value };
   }
-  const reason = posts.map(p => p.m?.notes?.[key]).find(Boolean) || posts.map(p => p.m?.error).find(Boolean);
-  return { value: null, reason: reason || NOT_FETCHED };
+  // The reason and its kind come from the same link, so the icon always matches the hover text.
+  const noted = posts.find(p => p.m?.notes?.[key] || p.m?.hidden?.[key] || p.m?.notShown?.[key]);
+  if (noted) return { value: null, reason: noted.m!.notes?.[key], kind: missingKind(noted.m!.notes?.[key], { hidden: noted.m!.hidden?.[key], notShown: noted.m!.notShown?.[key] }) };
+  const failed = posts.find(p => p.m?.error);
+  if (failed) return { value: null, reason: failed.m!.error, kind: missingKind(failed.m!.error, { unusable: failed.m!.unusable }) };
+  return { value: null, reason: NOT_FETCHED, kind: "retry" };
 }
 
 /** When the row's numbers were last fetched, oldest first, since that's the one that matters when checking a deliverable. */

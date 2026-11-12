@@ -2,11 +2,12 @@
 
 import { useState, useEffect, useCallback, useMemo, useRef } from "react";
 import { createClient } from "@/lib/supabase";
-import { STATS, rowStat, rowFetchedAt, planExportRows, lineToMetrics, currentLinks, type LinkMetrics, type MetricsByLink, type StatsLine } from "@/lib/live-plan-metrics";
+import { STATS, rowStat, rowFetchedAt, planExportRows, lineToMetrics, currentLinks, type LinkMetrics, type MetricsByLink, type MissingKind, type StatsLine } from "@/lib/live-plan-metrics";
 import { fetchPlanStats, NO_ANSWER } from "@/lib/live-plan-stats-client";
 import {
   Radar, Loader2, ExternalLink, ShieldCheck, Wallet, Lock, Search,
   CheckCircle2, Circle, Link2, AlertTriangle, FileSpreadsheet, Download, CloudUpload, RefreshCw, RotateCcw,
+  XCircle, EyeOff, MinusCircle, Clock,
 } from "lucide-react";
 
 const supabase = createClient();
@@ -80,6 +81,24 @@ const COUNTED = ["views", "likes", "comments", "shares", "reposts"] as const;
 const hasNumbers = (m?: LinkMetrics) => !!m && COUNTED.some(k => typeof m[k] === "number");
 const fetchedLabel = (at?: string) => at ? `Fetched ${new Date(at).toLocaleString("en-GB", { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZone: "Asia/Kolkata" })}` : undefined;
 const formatStat = (n: number | null) => n === null ? "—" : n === 0 ? "0" : compact(n);
+
+// One icon per reason a stat is missing, so a count the owner hid doesn't look like our fetch failing. The hover text gives the detail.
+const MISSING_ICON: Record<MissingKind, { Icon: typeof Clock; className: string; label: string }> = {
+  failed: { Icon: XCircle, className: "text-red-500", label: "Failed" },
+  hidden: { Icon: EyeOff, className: "text-slate-500", label: "Hidden by the owner" },
+  na: { Icon: MinusCircle, className: "text-slate-300", label: "Not shown for this type of post" },
+  retry: { Icon: Clock, className: "text-amber-500", label: "Waiting or needs a retry" },
+};
+
+function MissingStat({ kind }: { kind: MissingKind }) {
+  const { Icon, className, label } = MISSING_ICON[kind];
+  return (
+    <span className="inline-flex justify-end cursor-help">
+      <Icon className={`w-3.5 h-3.5 ${className}`} aria-hidden="true" />
+      <span className="sr-only">{label}</span>
+    </span>
+  );
+}
 
 function normaliseUrl(raw: string) {
   const v = raw.trim();
@@ -548,6 +567,15 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
               </div>
             )}
 
+            {/* What each missing-stat icon means. Hovering a cell gives the exact reason. */}
+            <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-500">
+              {(Object.keys(MISSING_ICON) as MissingKind[]).map(k => {
+                const { Icon, className, label } = MISSING_ICON[k];
+                return <span key={k} className="inline-flex items-center gap-1"><Icon className={`w-3.5 h-3.5 ${className}`} aria-hidden="true" />{label}</span>;
+              })}
+              <span className="inline-flex items-center gap-1"><span className="text-slate-400">—</span>No live link yet</span>
+            </div>
+
             {/* Table */}
             <div className="bg-white rounded-2xl border border-slate-200 overflow-hidden">
               <div className="overflow-x-auto">
@@ -653,7 +681,9 @@ export default function LiveMediaPlans({ userId, isAdmin, canVerify, embedded }:
                                 <td key={s.key} title={[stat.reason, stat.value !== null ? fetchedLabel(rowFetchedAt(row)) : undefined].filter(Boolean).join(". ") || undefined} className="px-3 py-3 text-right text-slate-600 tabular-nums">
                                   {loadingCell
                                     ? <span className="inline-block w-8 h-3 rounded bg-slate-200 animate-pulse" />
-                                    : <span className={stat.partial ? "underline decoration-dotted underline-offset-2 cursor-help" : ""}>{formatStat(stat.value)}</span>}
+                                    : stat.value === null && stat.kind
+                                      ? <MissingStat kind={stat.kind} />
+                                      : <span className={stat.partial ? "underline decoration-dotted underline-offset-2 cursor-help" : ""}>{formatStat(stat.value)}</span>}
                                 </td>
                               );
                             })}
