@@ -54,7 +54,8 @@ function toLine(raw: string, report: Report, done: boolean, key: string | undefi
     const c = report.metrics[m];
     // Instagram doesn't show views, shares or reposts on photos and carousels, so their gap is normal there, not our fault.
     const notShown = c.value === null && !c.hidden && NOT_ON_PHOTOS.includes(m) && isPhotoPost(report);
-    return [m, { value: c.value, note: c.note, ...(c.hidden && { hidden: true }), ...(notShown && { notShown: true }) }];
+    // The note then says so too, rather than a source failure that would happen on any photo.
+    return [m, { value: c.value, note: notShown ? `Instagram doesn't show ${m} on photos and carousels` : c.note, ...(c.hidden && { hidden: true }), ...(notShown && { notShown: true }) }];
   }));
   const hasNumber = Object.values(metrics).some((m) => m.value !== null);
   return { link: raw, url: report.link.url, key, metrics, done, ...(extra.savedAt && { savedAt: extra.savedAt }), ...(done && extra.warning && { warning: extra.warning }), ...(done && !hasNumber && { error: plainError(report) }) };

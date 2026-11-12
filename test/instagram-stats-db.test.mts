@@ -153,7 +153,10 @@ test('views, shares and reposts missing on a photo are marked as not shown', { s
   const line = (await ask(service, [PHOTO])).at(-1); // The final line: earlier ones are partial while the fetch runs.
   assert.equal(line.done, true);
   assert.equal(line.metrics.likes.value, 127);
-  for (const m of ['views', 'shares', 'reposts']) assert.equal(line.metrics[m]?.notShown, true, m);
+  for (const m of ['views', 'shares', 'reposts']) {
+    assert.equal(line.metrics[m]?.notShown, true, m);
+    assert.equal(line.metrics[m]?.note, `Instagram doesn't show ${m} on photos and carousels`);
+  }
   assert.equal(line.metrics.likes.notShown, undefined);
 });
 
