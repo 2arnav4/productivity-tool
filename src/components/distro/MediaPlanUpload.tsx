@@ -2,6 +2,7 @@
 
 import { useState, useRef } from "react";
 import { createClient } from "@/lib/supabase";
+import { fetchPlanStats } from "@/lib/live-plan-stats-client";
 import { FileSpreadsheet, Upload, Loader2, X, Check, AlertTriangle, Copy } from "lucide-react";
 import {
   FIELDS, readWorkbook, autoMap, buildItems, norm, parseAmount,
@@ -140,6 +141,10 @@ export default function MediaPlanUpload({ ensureBrief, onSaved }: Props) {
       await supabase.from("media_plans").delete().eq("id", plan.id);
       setError(`Couldn't save line items: ${itemErr.message}`);
       return;
+    }
+    // A link's first fetch happens when it's attached. The numbers are saved on the server, so nothing here waits for them.
+    if (rows.some(r => r.live_links.length)) {
+      fetchPlanStats({ planId: plan.id, mode: "attach", onLine: () => {} }).catch(err => console.error("Stats fetch after upload failed:", err));
     }
     onSaved?.(items.length);
     setOpen(false);

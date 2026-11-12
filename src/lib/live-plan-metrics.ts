@@ -1,0 +1,135 @@
+// A plan row's numbers, worked out from each link's answer. Used in the browser and on the server, so no scraper code or keys here.
+
+export const STATS = [
+  { key: "views", label: "Views" },
+  { key: "likes", label: "Likes" },
+  { key: "comments", label: "Comments" },
+  { key: "shares", label: "Shares" },
+  { key: "reposts", label: "Reposts" },
+  { key: "engagement", label: "Engagement" },
+] as const;
+
+export type StatKey = (typeof STATS)[number]["key"];
+type CountedKey = Exclude<StatKey, "engagement">;
+const ENGAGEMENT_PARTS: CountedKey[] = ["likes", "comments", "shares"];
+const NOT_FETCHED = "Stats not fetched yet";
+
+/** One line from the stats route. */
+export interface StatsLine {
+  link: string;
+  url?: string;
+  key?: string;
+  metrics?: Partial<Record<CountedKey, { value: number | null; note?: string }>>;
+  done?: boolean;
+  savedAt?: string;
+  warning?: string;
+  error?: string;
+  unusable?: boolean;
+}
+
+/** Stats for one live link. A null stat means unavailable, never 0. */
+export type LinkMetrics = Partial<Record<CountedKey, number | null>> & {
+  key?: string; // The post it points to, so two forms of one link count once.
+  notes?: Partial<Record<CountedKey, string>>;
+  error?: string; // Nothing could be read.
+  warning?: string; // Numbers are shown, but something about them isn't current.
+  unusable?: boolean; // Retrying can't help.
+  fetched_at?: string;
+};
+
+export type MetricsByLink = Record<string, LinkMetrics>;
+
+export function lineToMetrics(line: StatsLine): LinkMetrics {
+  const out: LinkMetrics = { key: line.key, notes: {}, error: line.error, warning: line.warning, unusable: line.unusable, fetched_at: line.savedAt };
+  for (const [name, count] of Object.entries(line.metrics ?? {}) as [CountedKey, { value: number | null; note?: string }][]) {
+    out[name] = count.value;
+    if (count.note) out.notes![name] = count.note;
+  }
+  return out;
+}
+
+interface RowWithLinks {
+  live_links?: string[] | null;
+  metrics?: MetricsByLink | null;
+}
+
+interface ExportRow extends RowWithLinks {
+  handle_name: string;
+  category?: string | null;
+  followers?: number | null;
+  quantity: number;
+  total_cost?: number | null;
+  verified: boolean;
+  paid: boolean;
+}
+
+export const currentLinks = (row: RowWithLinks) =>
+  (Array.isArray(row.live_links) ? row.live_links : []).filter(l => l && l.trim());
+
+/** A row's links, one per post: the same post pasted twice, even as /p/ and /reel/, counts once. */
+function rowPosts(row: RowWithLinks) {
+  const seen = new Set<string>();
+  const posts: { link: string; m?: LinkMetrics }[] = [];
+  for (const link of currentLinks(row)) {
+    const m = row.metrics?.[link];
+    const id = m?.key ?? link;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    posts.push({ link, m });
+  }
+  return posts;
+}
+
+/** A row's total for one stat across its current live links. A real 0 stays 0, and missing is never counted as 0. */
+export function rowStat(row: RowWithLinks, key: StatKey): { value: number | null; reason?: string; partial?: boolean } {
+  if (key === "engagement") {
+    const parts = ENGAGEMENT_PARTS.map(k => ({ k, stat: rowStat(row, k) }));
+    const counted = parts.filter(p => p.stat.value !== null);
+    if (!counted.length) return { value: null, reason: parts[0].stat.reason || NOT_FETCHED };
+    const incomplete = parts.filter(p => p.stat.value === null || p.stat.partial).map(p => p.k);
+    return {
+      value: counted.reduce((sum, p) => sum + (p.stat.value as number), 0),
+      partial: incomplete.length > 0,
+      reason: incomplete.length ? `Likes + comments + shares. Incomplete: ${incomplete.join(", ")}` : "Likes + comments + shares",
+    };
+  }
+  const posts = rowPosts(row);
+  const values = posts.map(p => p.m?.[key]).filter((v): v is number => typeof v === "number");
+  const flagged = posts.map(p => p.m?.warning).filter(Boolean).join(" ");
+  if (values.length > 0) {
+    const value = values.reduce((sum, v) => sum + v, 0);
+    const missing = posts.length - values.length;
+    // A total that leaves out a link must not read as complete: it gets compared against promised numbers
+    const reason = [missing > 0 ? `${missing} of ${posts.length} links missing` : "", flagged].filter(Boolean).join(". ");
+    return missing > 0 || flagged ? { value, partial: true, reason } : { value };
+  }
+  const reason = posts.map(p => p.m?.notes?.[key]).find(Boolean) || posts.map(p => p.m?.error).find(Boolean);
+  return { value: null, reason: reason || NOT_FETCHED };
+}
+
+/** When the row's numbers were last fetched, oldest first, since that's the one that matters when checking a deliverable. */
+export function rowFetchedAt(row: RowWithLinks): string | undefined {
+  const times = rowPosts(row).map(p => p.m?.fetched_at).filter((t): t is string => !!t);
+  return times.sort()[0];
+}
+
+/** The whole plan in the table's order and columns. Excel and the Drive Sheet both use this, so they can't drift apart. */
+export function planExportRows(items: ExportRow[]) {
+  const categoryOf = (i: ExportRow) => i.category || "Uncategorised";
+  const categories = [...new Set(items.map(categoryOf))];
+  const ordered = categories.flatMap(c => items.filter(i => categoryOf(i) === c));
+  return ordered.map((i, k) => {
+    const links = currentLinks(i);
+    return {
+      "#": k + 1,
+      "Page / Creator": i.handle_name,
+      "Followers": i.followers ?? "",
+      "Deliv.": `${Math.min(links.length, i.quantity)}/${i.quantity}`,
+      "Payout": i.total_cost ?? "",
+      "Live Links": links.join("\n"),
+      ...Object.fromEntries(STATS.map(s => [s.label, rowStat(i, s.key).value ?? ""])),
+      "Verified": i.verified ? "Yes" : "No",
+      "Paid": i.paid ? "Yes" : "No",
+    } as Record<string, string | number>;
+  });
+}

@@ -7,7 +7,8 @@
     "build": "next build",
     "start": "next start",
     "start:hostinger": "node server.js",
-    "lint": "eslint"
+    "lint": "eslint",
+    "test": "node --import tsx --test test/*.test.mts"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.104.1",
@@ -49,6 +50,7 @@
     "eslint": "^9",
     "eslint-config-next": "16.2.9",
     "tailwindcss": "^4",
+    "tsx": "^4.23.15",
     "typescript": "^5"
   }
 }
